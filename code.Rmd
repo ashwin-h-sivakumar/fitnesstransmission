@@ -1,0 +1,1092 @@
+---
+title: "Sivakumar and Reich 2026 Code Supplement"
+output: html_document
+date: "2026-02-03"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r fixedpop simulation, include=TRUE}
+
+library(foreach)
+library(doParallel)
+library(parallel)
+
+# Helper functions
+
+hetero <- function(v) {
+  tab <- table(v)
+  p <- as.numeric(tab) / length(v)
+  1 - sum(p^2)
+}
+
+# Apply k independent random transposition swaps to a vector
+apply_k_swaps <- function(v, k) {
+  n <- length(v)
+  if (k <= 0) return(v)
+  for (i in seq_len(k)) {
+    idx <- sample.int(n, size = 2, replace = FALSE)
+    tmp <- v[idx[1]]
+    v[idx[1]] <- v[idx[2]]
+    v[idx[2]] <- tmp
+  }
+  v
+}
+
+# Compute k(rho) from expected Spearman correlation decay
+k_from_rho <- function(rho, n) {
+  if (rho >= 1) return(0L)
+  if (rho <= 0) stop("rho must be in (0, 1].")
+  base <- (n - 3) / (n - 1)
+  as.integer(ceiling(log(rho) / log(base)))
+}
+
+# Generate male fitness a^(t) using father-only rank transmission
+gen_male_fitness <- function(n, V_M, rho_M, a_prev, fathers_idx) {
+
+  # Transmitted fitness signal: father fitness only
+  c_t <- a_prev[fathers_idx]
+
+  # Independent Gamma draw
+  if (V_M == 0) {
+    a_draw <- rep(2, n)
+  } else {
+    a_draw <- rgamma(n, shape = 4 / V_M, scale = V_M / 2)
+  }
+
+  # Rank-match to c_t
+  ord_c <- order(c_t)
+  ord_a <- order(a_draw)
+  a_rankmatched <- numeric(n)
+  a_rankmatched[ord_c] <- a_draw[ord_a]
+
+  # Apply swaps to achieve target rho_M
+  k <- k_from_rho(rho_M, n)
+  apply_k_swaps(a_rankmatched, k)
+}
+
+# Simulation function
+
+run_one_sim <- function(n = 5000, gens = 30, V_M, rho_M, seed = NULL, replicate_id = NA_integer_) {
+  if (!is.null(seed)) set.seed(seed)
+
+  # t = 0: unique alleles
+  ychrom <- seq_len(n)
+  mito   <- seq_len(n)
+  mauto  <- seq_len(2 * n)
+  fauto  <- (2 * n + 1):(4 * n)
+
+  # Female expected fitness fixed at 2
+  b_norm <- rep(1 / n, n)
+
+  # Male expected fitness at t = 0
+  if (V_M == 0) {
+    a <- rep(2, n)
+  } else {
+    a <- rgamma(n, shape = 4 / V_M, scale = V_M / 2)
+  }
+
+  divtracker <- data.frame(
+    t = integer(0),
+    replicate_id = integer(0),
+    seed = integer(0),
+    hetero_auto = numeric(0),
+    hetero_ychrom = numeric(0),
+    hetero_mito = numeric(0),
+    V_M = numeric(0),
+    rho_M = numeric(0)
+  )
+
+  for (t in 0:gens) {
+
+    auto <- c(mauto, fauto)
+    divtracker <- rbind(divtracker, data.frame(
+      t = t,
+      replicate_id = replicate_id,
+      seed = if (is.null(seed)) NA_integer_ else as.integer(seed),
+      hetero_auto = hetero(auto),
+      hetero_ychrom = hetero(ychrom),
+      hetero_mito = hetero(mito),
+      V_M = V_M,
+      rho_M = rho_M
+    ))
+
+    if (t == gens) break
+
+    # Parent sampling
+    a_norm <- a / sum(a)
+    fathers_idx <- sample.int(n, size = 2 * n, replace = TRUE, prob = a_norm)
+    mothers_idx <- sample.int(n, size = 2 * n, replace = TRUE, prob = b_norm)
+
+    f_male <- fathers_idx[1:n]
+    m_male <- mothers_idx[1:n]
+    f_fem  <- fathers_idx[(n + 1):(2 * n)]
+    m_fem  <- mothers_idx[(n + 1):(2 * n)]# Save previous-generation state (critical for correct autosomal inheritance)
+ychrom_old <- ychrom
+mito_old   <- mito
+mauto_old  <- mauto
+fauto_old  <- fauto
+
+# Y and mtDNA
+ychrom <- ychrom_old[f_male]  # father -> son
+mito   <- mito_old[m_fem]     # mother -> daughter
+
+# Autosomes (diploid): one allele from each parent with probability 0.5
+pick_allele <- function(auto_vec, idx) {
+  a1 <- auto_vec[2 * idx - 1]
+  a2 <- auto_vec[2 * idx]
+  ifelse(runif(length(idx)) < 0.5, a1, a2)
+}
+
+# Male offspring: paternal allele from mauto_old (father), maternal allele from fauto_old (mother)
+mauto <- as.vector(rbind(
+  pick_allele(mauto_old, f_male),
+  pick_allele(fauto_old, m_male)
+))
+
+# Female offspring: paternal allele from mauto_old (father), maternal allele from fauto_old (mother)
+fauto <- as.vector(rbind(
+  pick_allele(mauto_old, f_fem),
+  pick_allele(fauto_old, m_fem)
+))
+
+    # Update male fitness
+    if (rho_M == 0) {
+      if (V_M == 0) {
+        a <- rep(2, n)
+      } else {
+        a <- rgamma(n, shape = 4 / V_M, scale = V_M / 2)
+      }
+    } else {
+      a <- gen_male_fitness(n, V_M, rho_M, a_prev = a, fathers_idx = f_male)
+    }
+  }
+
+  divtracker
+}
+
+# Parallel setup
+
+numCores <- max(1, detectCores() - 1)
+cl <- makeCluster(numCores)
+registerDoParallel(cl)
+
+# Parameter grids
+
+# (A) Variance only
+# Exact inverse: given sigma2 (s), return V_M
+Vm_from_sigma2 <- function(sigma2, n_pop) {
+  num <- 8 * (n_pop - 1) - 4 * n_pop * sigma2
+  den <- sigma2 - 2 * (n_pop - 1)
+  num / den
+}
+
+n_pop <- 5000
+
+# Main Text grid (variance-only): sigma^2 from 2 to 20
+sigma_grid_var_only <- seq(2, 20, by = 2)
+var_only_Vm <- sapply(sigma_grid_var_only, Vm_from_sigma2, n_pop = n_pop)
+
+
+# (B) Transmission
+# Main Text grid: sigma^2 in {2,4,6,8,10} and rho_M in {0.2,0.4,0.6,0.8,1}
+sigma_grid_trans <- c(2.5, 3, 3.5, 4)
+trans_Vm <- sapply(sigma_grid_trans, Vm_from_sigma2, n_pop = n_pop)
+rho_vals <- c(0.2, 0.4, 0.6, 0.8, 0.95)
+
+# Run simulations
+
+results_var_only <- foreach(V_M = var_only_Vm, .combine = rbind) %:%
+  foreach(rep = 1:100, .combine = rbind) %dopar% {
+    seed <- as.integer(1e6 + 1000 * V_M + rep)
+    run_one_sim(V_M = V_M, rho_M = 0, seed = seed, replicate_id = rep)
+  }
+
+results_trans <- foreach(V_M = trans_Vm, .combine = rbind) %:%
+  foreach(rho_M = rho_vals, .combine = rbind) %:%
+  foreach(rep = 1:100, .combine = rbind) %dopar% {
+    # Skip redundant transmission when there is no variance in expected male fitness
+    if (V_M == 0 && rho_M > 0) return(NULL)
+    seed <- as.integer(2e6 + 10000 * V_M + 1000 * rho_M + rep)
+    run_one_sim(V_M = V_M, rho_M = rho_M, seed = seed, replicate_id = rep)
+  }
+
+results2 <- as.data.frame(rbind(results_var_only, results_trans))
+
+# Stop parallel cluster
+stopCluster(cl)
+
+# Save
+write.csv(results2, "popgen_results2.csv", row.names = FALSE)
+
+# Inspect
+print(head(results2))
+
+```
+
+```{r configuring data for Figures 1 and 2, include=TRUE}
+
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+
+# Ne from heterozygosity
+Ne_from_H <- function(Ht, t = 30) {
+  1 / (2 * (1 - Ht^(1 / t)))
+}
+
+# Collapse results2 
+Ne_summary <- results2 %>%
+  filter(t %in% c(0, 30)) %>%
+  group_by(V_M, rho_M, replicate_id) %>%
+  summarise(
+    H_auto_30 = hetero_auto[t == 30][1],
+    H_y_30    = hetero_ychrom[t == 30][1],
+    H_m_30    = hetero_mito[t == 30][1],
+    .groups = "drop"
+  ) %>%
+  mutate(
+    Ne_A = Ne_from_H(H_auto_30),
+    Ne_Y = Ne_from_H(H_y_30),
+    Ne_mito = Ne_from_H(H_m_30),
+
+    sigma2_M = 2 + V_M / 2
+  )
+
+nrow(Ne_summary)
+
+# Keep variance-only simulations (Figure 1 logic) 
+fig1_data <- Ne_summary %>%
+  filter(rho_M == 0) %>%
+  mutate(
+    xval = sqrt(sigma2_M - 2),
+    x_factor = factor(round(sigma2_M, 1))
+  )
+
+plot_df <- fig1_data %>%
+  pivot_longer(
+    cols = c(Ne_Y, Ne_A),
+    names_to = "type",
+    values_to = "Ne_num"
+  ) %>%
+  mutate(
+    ratio = Ne_num / Ne_mito,
+    type = recode(
+      type,
+      Ne_Y = "X = Y",
+      Ne_A = "X = A"
+    )
+  )
+
+```
+
+```{r}
+
+library(ggplot2)
+library(dplyr)
+
+plot_df <- fig1_data %>%
+  mutate(
+    ratio_Y = Ne_Y / Ne_mito,
+    ratio_A = Ne_A / Ne_mito
+  )
+
+# Linear scaling factor to align autosomes with Y visually
+scale_factor <- max(plot_df$ratio_Y, na.rm = TRUE) /
+                max(plot_df$ratio_A, na.rm = TRUE)
+
+
+fig1 <- ggplot(plot_df, aes(x = sigma2_M)) +
+
+  # Y chromosome: left axis 
+  geom_point(
+    aes(y = ratio_Y),
+    color = "#1f77b4",
+    alpha = 0.35,
+    size = 1.2,
+    position = position_jitter(width = 0.15, height = 0)
+  ) +
+  geom_smooth(
+    aes(y = ratio_Y),
+    color = "#1f77b4",
+    method = "loess",
+    se = FALSE,
+    linewidth = 1.3
+  ) +
+
+  # Autosomes: right axis (rescaled) 
+  geom_point(
+    aes(y = ratio_A * scale_factor),
+    color = "#d62728",
+    alpha = 0.35,
+    size = 1.2,
+    position = position_jitter(width = 0.15, height = 0)
+  ) +
+  geom_smooth(
+    aes(y = ratio_A * scale_factor),
+    color = "#d62728",
+    method = "loess",
+    se = FALSE,
+    linewidth = 1.3
+  ) +
+
+  # Reference line (Y bottleneck) 
+  geom_hline(
+    yintercept = 1 / 16,
+    linetype = "dashed",
+    linewidth = 0.8,
+    color = "#1f77b4"
+  ) +
+
+  # Axes
+  scale_y_continuous(
+    name = expression(N[e]^{(Y)} / N[e]^{(M)}),
+    sec.axis = sec_axis(
+      ~ . / scale_factor,
+      name = expression(N[e]^{(A)} / N[e]^{(M)})
+    )
+  ) +
+
+  labs(
+    x = expression(sigma[M]^2)
+  ) +
+
+  coord_cartesian(ylim = c(0, max(plot_df$ratio_Y) * 1.05)) +
+
+  theme_bw() +
+  theme(
+    axis.title.x = element_text(size = 18),
+    axis.title.y.left  = element_text(size = 16, color = "#1f77b4"),
+    axis.title.y.right = element_text(size = 16, color = "#d62728"),
+    axis.text.y.left   = element_text(color = "#1f77b4"),
+    axis.text.y.right  = element_text(color = "#d62728"),
+    axis.text          = element_text(size = 14)
+  )
+
+# ggsave(
+#   filename = "Figure1",
+#   plot = fig1,
+#   width = 10,
+#   height = 6,
+#   units = "in"
+# )
+
+print(fig1)
+
+```
+
+```{r}
+
+library(dplyr)
+library(ggplot2)
+library(splines)
+library(scales)
+library(patchwork)
+
+
+# Helper: Ne from heterozygosity
+
+Ne_from_H <- function(Ht, t = 30) {
+  1 / (2 * (1 - Ht^(1 / t)))
+}
+
+
+# Prepare Ne summary (if not already done)
+
+Ne_summary <- results2 %>%
+  filter(t %in% c(0, 30)) %>%
+  group_by(V_M, rho_M, replicate_id) %>%
+  summarise(
+    H_auto_30 = hetero_auto[t == 30][1],
+    H_y_30    = hetero_ychrom[t == 30][1],
+    H_m_30    = hetero_mito[t == 30][1],
+    .groups = "drop"
+  ) %>%
+  mutate(
+    AutoNe = Ne_from_H(H_auto_30),
+    YNe    = Ne_from_H(H_y_30),
+    MitoNe = Ne_from_H(H_m_30),
+
+    AutoNe_MitoNe_ratio = AutoNe / MitoNe,
+    YNe_MitoNe_ratio    = YNe / MitoNe,
+
+    sigma_M2 = 2 + V_M / 2,
+    sigma_M2_lab = factor(sprintf("%.1f", sigma_M2)),  # rounded legend labels
+    rho_squared = rho_M^2
+  )
+
+# Small horizontal jitter amount
+x_jitter <- 0.002
+
+
+# Generate spline curves (generic)
+
+generate_spline <- function(data, yvar, df = 4, ngrid = 100) {
+
+  bind_rows(lapply(unique(data$sigma_M2), function(s) {
+
+    dsub <- data %>%
+      filter(sigma_M2 == s) %>%
+      arrange(rho_squared)
+
+    if (nrow(dsub) < df) return(NULL)
+
+    xseq <- seq(min(dsub$rho_squared),
+                max(dsub$rho_squared),
+                length.out = ngrid)
+
+    fit <- lm(
+      as.formula(paste(yvar, "~ ns(rho_squared, df =", df, ")")),
+      data = dsub
+    )
+
+    data.frame(
+      rho_squared = xseq,
+      y_pred = predict(fit, newdata = data.frame(rho_squared = xseq)),
+      sigma_M2_lab = factor(sprintf("%.1f", s))
+    )
+  }))
+}
+
+# Figure 2a: Y / Mito
+
+plot_data_2a <- Ne_summary %>%
+  filter(rho_M > 0, !is.na(YNe_MitoNe_ratio))
+
+curves_2a <- generate_spline(plot_data_2a, "YNe_MitoNe_ratio")
+
+fig2a <- ggplot() +
+  geom_line(
+    data = curves_2a,
+    aes(x = rho_squared, y = y_pred, color = sigma_M2_lab),
+    linewidth = 1.2
+  ) +
+  geom_point(
+  data = plot_data_2a,
+  aes(
+    x = rho_squared,
+    y = YNe_MitoNe_ratio,
+    color = sigma_M2_lab
+  ),
+  alpha = 0.3,
+  size = 0.4,
+  position = position_jitter(width = 0.002, height = 0)
+  ) +
+  geom_hline(yintercept = 1 / 17, linetype = "dotted", linewidth = 1) +
+  scale_color_viridis_d(name = expression(sigma[M]^2)) +
+  labs(
+    x = expression(rho[M]^2),
+    y = expression(N[e]^{(Y)} / N[e]^{(M)})
+  ) +
+  theme_minimal(base_size = 14) +
+  theme(legend.position = "right")
+
+
+# Figure 2b: Autosomal / Mito
+
+plot_data_2b <- Ne_summary %>%
+  filter(rho_M > 0, !is.na(AutoNe_MitoNe_ratio))
+
+curves_2b <- generate_spline(plot_data_2b, "AutoNe_MitoNe_ratio")
+
+fig2b <- ggplot() +
+  geom_line(
+    data = curves_2b,
+    aes(x = rho_squared, y = y_pred, color = sigma_M2_lab),
+    linewidth = 1.2
+  ) +
+  geom_point(
+  data = plot_data_2b,
+  aes(
+    x = rho_squared,
+    y = AutoNe_MitoNe_ratio,
+    color = sigma_M2_lab
+  ),
+  alpha = 0.3,
+  size = 0.4,
+  position = position_jitter(width = 0.002, height = 0)
+) +
+  geom_hline(
+  yintercept = 1490 / 5000,
+  linetype = "dotted",
+  linewidth = 0.8
+) +
+  scale_color_viridis_d(name = expression(sigma[M]^2)) +
+  labs(
+    x = expression(rho[M]^2),
+    y = expression(N[e]^{(A)} / N[e]^{(M)})
+  ) +
+  theme_minimal(base_size = 14) +
+  theme(legend.position = "right")
+
+# Combine into a single figure with panel labels
+
+combined_fig <- fig2a / fig2b +
+  plot_annotation(
+    tag_levels = "a",
+    theme = theme(
+      plot.tag = element_text(face = "bold", size = 16)
+    )
+  )
+
+# Save
+# ggsave(
+#   "fig2_combined.svg",
+#   plot = combined_fig,
+#   width = 8,
+#   height = 11
+# )
+
+print(combined_fig)
+
+```
+
+
+```{r growth_simulation, include=TRUE}
+
+het <- function(v) {
+  n <- length(v)
+  if (n <= 1) return(0)
+  rl <- rle(sort.int(v, method = "quick"))$lengths
+  p <- rl / n
+  1 - sum(p^2)
+}
+
+
+simulate_one <- function(sigma2,
+                         c_top,
+                         T = 30,
+                         n0_m = 5000,
+                         n0_f = 5000,
+                         r = 0.005,
+                         K_m = Inf,
+                         K_f = Inf) {
+
+  # compute VM so that marginal σ² ≈ 2 + VM^2  (preserve your original mapping)
+  VM <- max(0, 2 * (sigma2 - 2))
+
+  if (VM > 0) {
+    shape <- 4 / VM
+    scale <- VM / 2
+  }
+
+  # storage
+  H_Y        <- numeric(T + 1); H_Y[1]     <- 1
+  H_mito     <- numeric(T + 1); H_mito[1]  <- 1
+  H_A        <- numeric(T + 1); H_A[1]     <- 1
+  rank_corr  <- numeric(T + 1); rank_corr[1] <- NA_real_
+  prop_top10 <- numeric(T + 1)
+
+  # initial population
+  n_m <- n0_m
+  n_f <- n0_f
+
+  # initial a_prev: draw from Gamma (no sorting first gen)
+  a_prev <- if (VM == 0) rep(2, n_m) else rgamma(n_m, shape = shape, scale = scale)
+
+  # initial top-lineage fraction (your code uses 0.2; keep it)
+  prop_top10[1] <- 0.2
+
+  # unique allele labels
+  y <- seq_len(n_m)
+  x <- seq_len(n_f)
+  w <- seq_len(2 * n_m)
+  z <- (2 * n_m + 1):(2 * n_m + 2 * n_f)
+
+  for (g in 1:T) {
+
+    # 1) logistic growth (as you had)
+    n_m_next <- round(n0_m * (1 + r)^g)
+    n_f_next <- round(n0_f * (1 + r)^g)
+
+    # guard against pathological shrink to 0
+    n_m_next <- max(1L, n_m_next)
+    n_f_next <- max(1L, n_f_next)
+
+    # 2) sample parents
+    # fathers: weighted by male expected fitness 
+    prob_f <- a_prev / sum(a_prev)
+    fathers <- sample.int(n_m, size = n_m_next, replace = TRUE, prob = prob_f)
+
+    # mothers: uniform among females
+    mothers <- sample.int(n_f, size = n_f_next, replace = TRUE)
+
+    # record fraction of sons whose father is in top 10% of a_prev
+    cutoff_prev  <- as.numeric(stats::quantile(a_prev, 0.9, type = 7, names = FALSE))
+    high_fathers <- which(a_prev >= cutoff_prev)
+    is_high_son  <- fathers %in% high_fathers
+    prop_top10[g + 1] <- mean(is_high_son)
+
+    # 3) allele transmission
+    y_new <- y[fathers]
+    x_new <- x[mothers]
+
+    # autosomes
+    paternal_m <- vapply(fathers, function(i) sample(w[(2*i-1):(2*i)], 1), numeric(1))
+    maternal_m <- vapply(mothers, function(i) sample(z[(2*i-1):(2*i)], 1), numeric(1))
+    w_new <- as.vector(rbind(paternal_m, maternal_m))
+
+    paternal_f <- vapply(fathers, function(i) sample(w[(2*i-1):(2*i)], 1), numeric(1))
+    maternal_f <- vapply(mothers, function(i) sample(z[(2*i-1):(2*i)], 1), numeric(1))
+    z_new <- as.vector(rbind(paternal_f, maternal_f))
+
+    # update state to generation g
+    n_m <- n_m_next
+    n_f <- n_f_next
+    y <- y_new
+    x <- x_new
+    w <- w_new
+    z <- z_new
+
+    # 4) draw all raw fitness values for the new generation 
+    raw_vals <- if (VM == 0) rep(2, n_m) else rgamma(n_m, shape = shape, scale = scale)
+
+    # fix to top 1000 (or fewer if n_m < 1000)
+    num_top <- min(1000, n_m)
+    sorted_inds <- order(raw_vals, decreasing = TRUE)
+    top_inds <- sorted_inds[1:num_top]
+    bot_inds <- if (num_top < n_m) sorted_inds[(num_top + 1):n_m] else integer(0)
+
+    # which sons are high-lineage?
+    high_sons <- which(is_high_son)
+    low_sons  <- setdiff(seq_len(n_m), high_sons)
+
+    # assign exactly c_top of those top-1000 draws to high-lineage sons
+    c_high <- min(c_top, length(high_sons), num_top)
+
+    top_draws <- raw_vals[top_inds]
+    perm <- sample.int(num_top)
+
+    high_draws <- if (c_high > 0) top_draws[perm[1:c_high]] else numeric(0)
+    low_draws  <- if (num_top > c_high) top_draws[perm[(c_high + 1):num_top]] else numeric(0)
+
+    a_current <- numeric(n_m)
+
+    sel_h <- integer(0)
+    sel_l <- integer(0)
+
+    # a) to high-lineage sons
+    if (c_high > 0) {
+      sel_h <- sample(high_sons, c_high)
+      a_current[sel_h] <- sample(high_draws, c_high)
+    }
+
+    # b) remainder of top-1000 to low-lineage sons
+    rem_top <- num_top - c_high
+    if (rem_top > 0) {
+      sel_l <- sample(low_sons, rem_top)
+      a_current[sel_l] <- sample(low_draws, rem_top)
+    }
+
+    # c) everyone else gets bottom draws (preserve your replace=TRUE behavior)
+    remainder <- setdiff(seq_len(n_m), c(sel_h, sel_l))
+    if (length(remainder) > 0) {
+      if (length(bot_inds) > 0) {
+        a_current[remainder] <- sample(raw_vals[bot_inds], length(remainder), replace = TRUE)
+      } else {
+        # if num_top == n_m (no bottom), fill remaining from top_draws
+        a_current[remainder] <- sample(top_draws, length(remainder), replace = TRUE)
+      }
+    }
+
+    # 6) record het & rank-corr
+    H_Y[g + 1]    <- het(y)
+    H_mito[g + 1] <- het(x)
+    H_A[g + 1]    <- het(c(w, z))
+    rank_corr[g + 1] <- suppressWarnings(cor(a_prev[fathers], a_current, method = "spearman"))
+
+    # slide
+    a_prev <- a_current
+  }
+
+  # instantaneous Ne (as you had)
+  gens <- 1:T
+  Ne_Y    <- -1 / (2 * log(H_Y[-1]    / H_Y[-(T + 1)]))
+  Ne_mito <- -1 / (2 * log(H_mito[-1] / H_mito[-(T + 1)]))
+  Ne_A    <- -1 / (2 * log(H_A[-1]    / H_A[-(T + 1)]))
+
+  data.frame(
+    generation = gens,
+    Ne_Y       = Ne_Y,
+    Ne_mito    = Ne_mito,
+    Ne_A       = Ne_A,
+    rank_corr  = rank_corr[-1],
+    prop_top10 = prop_top10[-1]
+  )
+}
+
+sigma2_fixed <- 3
+r_values     <- c(0, 0.05)
+init_props   <- c(0.005)  # unused but kept
+elite_caps   <- c(200, 400, 600, 800, 999)
+
+all_results <- list()
+n0_m <- 5000
+
+for (r_val in r_values) {
+  for (init_prop in init_props) {
+    for (cap_num in elite_caps) {
+
+      # skip any cap_num > 0.2 * n0_m 
+      if (cap_num > floor(0.2 * n0_m)) next
+
+      for (iter in 1:20) {
+
+        sim_df <- simulate_one(
+          sigma2 = sigma2_fixed,
+          c_top  = cap_num,
+          T      = 30,
+          n0_m   = n0_m,
+          n0_f   = 5000,
+          r      = r_val,
+          K_m    = Inf,
+          K_f    = Inf
+        )
+
+        sim_df$r         <- r_val
+        sim_df$init_prop <- init_prop
+        sim_df$c_top     <- cap_num
+        sim_df$replicate <- iter
+
+        all_results[[length(all_results) + 1]] <- sim_df
+      }
+    }
+  }
+}
+
+final_results_2 <- do.call(rbind, all_results)
+write.csv(final_results_2, "final_results_growth.csv", row.names = FALSE)
+
+
+```
+
+
+```{r}
+
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+
+Ne_from_H <- function(H_curr, H_prev) {
+  if (is.na(H_curr) || is.na(H_prev) || H_curr <= 0 || H_prev <= 0) return(NA_real_)
+  ratio <- H_curr / H_prev
+  if (ratio >= 1) return(NA_real_)  # no drift or numerical noise
+  1 / (2 * (1 - ratio))
+}
+
+final_results_subset <- subset(final_results_2, r == 0.05)
+
+# 1) Reshape into long form
+df_long <- final_results_subset %>%
+  pivot_longer(
+    cols      = c(Ne_Y, Ne_mito, Ne_A),
+    names_to  = "Locus",
+    values_to = "Ne"
+  ) %>%
+  mutate(
+    facet_label = paste0("c=", c_top),
+    logNe = log(Ne)
+  )
+
+# 2) Create a single label for each parameter combo
+df_long <- df_long %>%
+  mutate(
+    facet_label = paste0(
+      #"r=",    sprintf("%.3f", r),  "\n",
+      "c=",    c_top
+    )
+  )
+
+fig3 <- ggplot(df_long, aes(x = generation, y = logNe, color = Locus)) +
+  geom_smooth(se = TRUE) +
+  facet_wrap(
+    ~ facet_label,
+    ncol   = 5,
+    scales = "free_y"
+  ) +
+  labs(
+    x     = "Generation",
+    y     = expression(log(N[e])),
+    color = "Locus"
+  ) +
+  scale_color_manual(
+    values = c(
+      "Ne_Y"    = "#56B4E9",
+      "Ne_A"    = "#E69F00",
+      "Ne_mito" = "#009E73"
+    ),
+    labels = c(
+      "Ne_Y"    = expression(N[e]^{(Y)}),
+      "Ne_A"    = expression(N[e]^{(A)}),
+      "Ne_mito" = expression(N[e]^{(M)})
+    )
+  ) +
+  theme_minimal(base_size = 10) +
+  theme(
+    strip.text       = element_text(size = 8, face = "bold"),
+    axis.text        = element_text(size = 7),
+    axis.title       = element_text(size = 9, face = "bold"),
+    legend.position  = "bottom",
+    panel.spacing    = unit(0.8, "lines")
+  )
+
+final_results_subset
+rho_df <- final_results_subset %>%
+  filter(!is.na(rank_corr)) %>%
+  mutate(c_top = factor(c_top, levels = sort(unique(c_top))))
+
+fig3a <- ggplot(rho_df, aes(x = generation, y = rank_corr)) +
+  geom_smooth(
+    method = "loess",
+    se = TRUE,
+    span = 0.35,
+    linewidth = 1.1,
+    alpha = 0.5
+  ) +
+  ylim(0, 0.25) +
+  facet_wrap(
+    ~ c_top,
+    ncol = 5,
+    labeller = labeller(c_top = function(x) paste0("c = ", x))
+  ) +
+  labs(
+    x = "Generation",
+    y = expression(rho[M]^2)
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(
+    strip.text      = element_text(size = 8, face = "bold"),
+    axis.text       = element_text(size = 7),
+    axis.title      = element_text(size = 9, face = "bold"),
+    legend.position = "bottom",
+    panel.spacing   = unit(0.8, "lines")
+  )
+
+library(patchwork)
+
+fig3_combined <- fig3a / fig3 +
+  plot_annotation(
+    tag_levels = "a",
+    theme = theme(
+      plot.tag = element_text(face = "bold", size = 14)
+    )
+  )
+
+print(fig3_combined)
+
+```
+
+```{r}
+
+set.seed(123)
+
+library(ggplot2)
+
+n <- 5000
+k_values <- seq(0, 10000, by = 200)
+n_rep <- 20   # number of independent runs per k
+
+initial <- 1:n
+
+random_swaps <- function(x, k) {
+  n <- length(x)
+  for (i in seq_len(k)) {
+    idx <- sample.int(n, 2, replace = FALSE)
+    x[idx] <- x[rev(idx)]
+  }
+  x
+}
+
+results <- data.frame()
+
+for (k in k_values) {
+  for (rep in seq_len(n_rep)) {
+    final_vec <- random_swaps(initial, k)
+    rho <- cor(initial, final_vec, method = "spearman")
+    results <- rbind(
+      results,
+      data.frame(k = k, rho = rho)
+    )
+  }
+}
+
+# Expected curve
+k_curve <- seq(0, 10000, length.out = 500)
+expect_df <- data.frame(
+  k = k_curve,
+  rho = exp(-k_curve / 2499.5)
+)
+
+results$residual <- results$rho - exp(-results$k / 2499.5)
+
+
+library(ggplot2)
+library(patchwork)
+
+p_main <- ggplot(results, aes(x = k, y = rho)) +
+  geom_jitter(width = 0, height = 0.002, alpha = 0.4) +
+  geom_line(
+    data = expect_df,
+    aes(x = k, y = rho, color = "theory"),
+    linewidth = 1.2
+  ) +
+  scale_color_manual(
+    values = c("theory" = "red"),
+    labels = expression(k == -2499.5 * ln(rho)),
+    name = NULL
+  ) +
+  labs(
+    x = "k",
+    y = expression(rho)
+  ) +
+  theme_minimal(base_size = 14) +
+  theme(
+    legend.position = "right"
+  )
+
+p_resid <- ggplot(results, aes(x = k, y = residual)) +
+  geom_point(alpha = 0.5, size = 1.5) +
+  geom_hline(yintercept = 0, linetype = "dashed") +
+  geom_quantile(
+    quantiles = c(0.05, 0.95),
+    linewidth = 1,
+    color = "black"
+  ) +
+  labs(
+    x = expression(k),
+    y = expression(E(rho) - rho)
+  ) +
+  theme_minimal(base_size = 14)
+
+FigS1 <- p_main + p_resid +
+  plot_layout(widths = c(8, 8)) &
+  theme(plot.margin = margin(5.5, 12, 5.5, 5.5))
+
+#ggsave("FigureS1.svg", width = 16, height = 6, dpi = 300)
+
+print(FigS1)
+
+```
+
+```{r}
+
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+
+final_results_subset <- subset(final_results_2, r == 0)
+
+# 1) Reshape into long form
+df_long <- final_results_subset %>%
+  pivot_longer(
+    cols      = c(Ne_Y, Ne_mito, Ne_A),
+    names_to  = "Locus",
+    values_to = "Ne"
+  )
+
+# 2) Create a single label for each parameter combo
+df_long <- df_long %>%
+  mutate(
+    facet_label = paste0(
+      #"r=",    sprintf("%.3f", r),  "\n",
+      "c=",    c_top
+    )
+  )
+
+df_long
+# 3) Plot log(Ne) with geom_smooth, faceted by parameter combo
+fig3 <- ggplot(df_long, aes(x = generation, y = log(Ne), color = Locus)) +
+  geom_smooth(se = TRUE) +
+  facet_wrap(
+    ~ facet_label,
+    ncol   = 5,
+    scales = "free_y"
+  ) +
+  labs(
+    x     = "Generation",
+    y     = expression(log(N[e])),
+    color = "Locus",
+    #title = "Smoothed log(Ne) trajectories for each (r, init_prop, c_top)"
+  ) +
+  scale_color_manual(
+    values = c(
+      "Ne_Y"    = "#56B4E9",  # sky blue (brighter)
+      "Ne_A"    = "#E69F00",  # bright orange
+      "Ne_mito" = "#009E73"   # bluish green
+    ),
+    labels = c(
+      "Ne_Y"    = expression(N[e]^{(Y)}),
+      "Ne_A"    = expression(N[e]^{(A)}),
+      "Ne_mito" = expression(N[e]^{(M)})
+    )
+  ) +
+  theme_minimal(base_size = 10) +
+  theme(
+    strip.text       = element_text(size = 8, face = "bold"),
+    axis.text        = element_text(size = 7),
+    axis.title       = element_text(size = 9, face = "bold"),
+    legend.position  = "bottom",
+    panel.spacing    = unit(0.8, "lines")
+  )
+
+# 1) Tidy
+rho_df <- final_results_subset %>%
+  filter(!is.na(rank_corr)) %>%
+  mutate(c_top = factor(c_top, levels = sort(unique(c_top))))
+
+# 2) Plot: smooth line + confidence cloud, faceted by c_top
+fig3a <- ggplot(rho_df, aes(x = generation, y = rank_corr^2)) +
+  geom_smooth(
+    method = "loess",
+    se = TRUE,
+    span = 0.35,
+    linewidth = 1.1,
+    alpha = 0.5
+  ) +
+  ylim(0, 0.25) +
+  facet_wrap(
+    ~ c_top,
+    ncol = 5,
+    labeller = labeller(c_top = function(x) paste0("c = ", x))
+  ) +
+  labs(
+    x = "Generation",
+    y = expression(rho[M]^2)
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(
+    strip.text      = element_text(size = 8, face = "bold"),
+    axis.text       = element_text(size = 7),
+    axis.title      = element_text(size = 9, face = "bold"),
+    legend.position = "bottom",
+    panel.spacing   = unit(0.8, "lines")
+  )
+
+library(patchwork)
+
+FigS2 <- fig3a / fig3 +
+  plot_annotation(
+    tag_levels = "a",
+    theme = theme(
+      plot.tag = element_text(face = "bold", size = 14)
+    )
+  )
+
+# ggsave(
+#   "FigureS2.png",
+#   plot  = fig3_combined,
+#   width = 8,
+#   height = 12,
+#   dpi   = 300
+# )
+
+print(FigS2)
+
+```
+
+
+
+
+
